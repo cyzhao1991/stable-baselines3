@@ -1,0 +1,2 @@
+from stable_baselines3.discrete_sac.policies import CnnPolicy, MlpPolicy, MultiInputPolicy
+from stable_baselines3.discrete_sac.discrete_sac import DiscreteSAC

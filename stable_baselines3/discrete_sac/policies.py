@@ -5,7 +5,7 @@ import gym
 import torch as th
 from torch import nn
 
-from stable_baselines3.common.distributions import SquashedDiagGaussianDistribution, StateDependentNoiseDistribution
+from stable_baselines3.common.distributions import CategoricalDistribution
 from stable_baselines3.common.policies import BasePolicy, ContinuousCritic, register_policy
 from stable_baselines3.common.preprocessing import get_action_dim
 from stable_baselines3.common.torch_layers import (
@@ -57,12 +57,7 @@ class Actor(BasePolicy):
         features_extractor: nn.Module,
         features_dim: int,
         activation_fn: Type[nn.Module] = nn.ReLU,
-        use_sde: bool = False,
-        log_std_init: float = -3,
-        full_std: bool = True,
-        sde_net_arch: Optional[List[int]] = None,
-        use_expln: bool = False,
-        clip_mean: float = 2.0,
+        # clip_mean: float = 2.0,
         normalize_images: bool = True,
     ):
         super(Actor, self).__init__(
@@ -70,44 +65,23 @@ class Actor(BasePolicy):
             action_space,
             features_extractor=features_extractor,
             normalize_images=normalize_images,
-            squash_output=True,
+            squash_output=False,
         )
 
         # Save arguments to re-create object at loading
-        self.use_sde = use_sde
-        self.sde_features_extractor = None
+
         self.net_arch = net_arch
         self.features_dim = features_dim
         self.activation_fn = activation_fn
-        self.log_std_init = log_std_init
-        self.sde_net_arch = sde_net_arch
-        self.use_expln = use_expln
-        self.full_std = full_std
-        self.clip_mean = clip_mean
 
         if sde_net_arch is not None:
             warnings.warn("sde_net_arch is deprecated and will be removed in SB3 v2.4.0.", DeprecationWarning)
 
-        action_dim = get_action_dim(self.action_space)
-        latent_pi_net = create_mlp(features_dim, -1, net_arch, activation_fn)
-        self.latent_pi = nn.Sequential(*latent_pi_net)
+        action_dim = self.action_space.n
+        pi_net = create_mlp(features_dim, action_dim, net_arch, activation_fn)
+        self.action_logits = nn.Sequential(*pi_net)
         last_layer_dim = net_arch[-1] if len(net_arch) > 0 else features_dim
-
-        if self.use_sde:
-            self.action_dist = StateDependentNoiseDistribution(
-                action_dim, full_std=full_std, use_expln=use_expln, learn_features=True, squash_output=True
-            )
-            self.mu, self.log_std = self.action_dist.proba_distribution_net(
-                latent_dim=last_layer_dim, latent_sde_dim=last_layer_dim, log_std_init=log_std_init
-            )
-            # Avoid numerical issues by limiting the mean of the Gaussian
-            # to be in [-clip_mean, clip_mean]
-            if clip_mean > 0.0:
-                self.mu = nn.Sequential(self.mu, nn.Hardtanh(min_val=-clip_mean, max_val=clip_mean))
-        else:
-            self.action_dist = SquashedDiagGaussianDistribution(action_dim)
-            self.mu = nn.Linear(last_layer_dim, action_dim)
-            self.log_std = nn.Linear(last_layer_dim, action_dim)
+        self.action_dist = CategoricalDistribution(action_dim)
 
     def _get_constructor_parameters(self) -> Dict[str, Any]:
         data = super()._get_constructor_parameters()
@@ -117,12 +91,7 @@ class Actor(BasePolicy):
                 net_arch=self.net_arch,
                 features_dim=self.features_dim,
                 activation_fn=self.activation_fn,
-                use_sde=self.use_sde,
-                log_std_init=self.log_std_init,
-                full_std=self.full_std,
-                use_expln=self.use_expln,
                 features_extractor=self.features_extractor,
-                clip_mean=self.clip_mean,
             )
         )
         return data
@@ -160,32 +129,25 @@ class Actor(BasePolicy):
             Mean, standard deviation and optional keyword arguments.
         """
         features = self.extract_features(obs)
-        latent_pi = self.latent_pi(features)
-        mean_actions = self.mu(latent_pi)
-
-        if self.use_sde:
-            return mean_actions, self.log_std, dict(latent_sde=latent_pi)
-        # Unstructured exploration (Original implementation)
-        log_std = self.log_std(latent_pi)
-        # Original Implementation to cap the standard deviation
-        log_std = th.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-        return mean_actions, log_std, {}
+        action_logits = self.action_logits(features)
+        return action_logits, {}
 
     def forward(self, obs: th.Tensor, deterministic: bool = False) -> th.Tensor:
-        mean_actions, log_std, kwargs = self.get_action_dist_params(obs)
+        action_logits, kwargs = self.get_action_dist_params(obs)
         # Note: the action is squashed
-        return self.action_dist.actions_from_params(mean_actions, log_std, deterministic=deterministic, **kwargs)
+        return self.action_dist.actions_from_params(action_logits, deterministic=deterministic, **kwargs)
 
     def action_log_prob(self, obs: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
-        mean_actions, log_std, kwargs = self.get_action_dist_params(obs)
+        action_logits, kwargs = self.get_action_dist_params(obs)
         # return action and associated log prob
-        return self.action_dist.log_prob_from_params(mean_actions, log_std, **kwargs)
+        return self.action_dist.log_prob_from_params(action_logits, **kwargs)
+    
 
     def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
         return self(observation, deterministic)
 
 
-class SACPolicy(BasePolicy):
+class DiscreteSACPolicy(BasePolicy):
     """
     Policy class (with both actor and critic) for SAC.
 
@@ -224,11 +186,6 @@ class SACPolicy(BasePolicy):
         lr_schedule: Schedule,
         net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
         activation_fn: Type[nn.Module] = nn.ReLU,
-        use_sde: bool = False,
-        log_std_init: float = -3,
-        sde_net_arch: Optional[List[int]] = None,
-        use_expln: bool = False,
-        clip_mean: float = 2.0,
         features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
         features_extractor_kwargs: Optional[Dict[str, Any]] = None,
         normalize_images: bool = True,
@@ -237,14 +194,14 @@ class SACPolicy(BasePolicy):
         n_critics: int = 2,
         share_features_extractor: bool = True,
     ):
-        super(SACPolicy, self).__init__(
+        super(DiscreteSACPolicy, self).__init__(
             observation_space,
             action_space,
             features_extractor_class,
             features_extractor_kwargs,
             optimizer_class=optimizer_class,
             optimizer_kwargs=optimizer_kwargs,
-            squash_output=True,
+            squash_output=False,
         )
 
         if net_arch is None:
@@ -265,17 +222,7 @@ class SACPolicy(BasePolicy):
             "normalize_images": normalize_images,
         }
         self.actor_kwargs = self.net_args.copy()
-
-        if sde_net_arch is not None:
-            warnings.warn("sde_net_arch is deprecated and will be removed in SB3 v2.4.0.", DeprecationWarning)
-
-        sde_kwargs = {
-            "use_sde": use_sde,
-            "log_std_init": log_std_init,
-            "use_expln": use_expln,
-            "clip_mean": clip_mean,
-        }
-        self.actor_kwargs.update(sde_kwargs)
+        self.actor_kwargs.update()
         self.critic_kwargs = self.net_args.copy()
         self.critic_kwargs.update(
             {
@@ -322,10 +269,10 @@ class SACPolicy(BasePolicy):
             dict(
                 net_arch=self.net_arch,
                 activation_fn=self.net_args["activation_fn"],
-                use_sde=self.actor_kwargs["use_sde"],
-                log_std_init=self.actor_kwargs["log_std_init"],
-                use_expln=self.actor_kwargs["use_expln"],
-                clip_mean=self.actor_kwargs["clip_mean"],
+                # use_sde=self.actor_kwargs["use_sde"],
+                # log_std_init=self.actor_kwargs["log_std_init"],
+                # use_expln=self.actor_kwargs["use_expln"],
+                # clip_mean=self.actor_kwargs["clip_mean"],
                 n_critics=self.critic_kwargs["n_critics"],
                 lr_schedule=self._dummy_schedule,  # dummy lr schedule, not needed for loading policy alone
                 optimizer_class=self.optimizer_class,
@@ -371,10 +318,16 @@ class SACPolicy(BasePolicy):
         self.training = mode
 
 
-MlpPolicy = SACPolicy
+MlpPolicy = DiscreteSACPolicy
+
+'''
 
 
-class CnnPolicy(SACPolicy):
+Todo
+
+
+
+class CnnPolicy(DiscreteSACPolicy):
     """
     Policy class (with both actor and critic) for SAC.
 
@@ -445,7 +398,7 @@ class CnnPolicy(SACPolicy):
         )
 
 
-class MultiInputPolicy(SACPolicy):
+class MultiInputPolicy(DiscreteSACPolicy):
     """
     Policy class (with both actor and critic) for SAC.
 
@@ -478,7 +431,7 @@ class MultiInputPolicy(SACPolicy):
     def __init__(
         self,
         observation_space: gym.spaces.Space,
-        action_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,SACPolicy
         lr_schedule: Schedule,
         net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
         activation_fn: Type[nn.Module] = nn.ReLU,
