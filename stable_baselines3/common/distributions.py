@@ -276,6 +276,12 @@ class CategoricalDistribution(Distribution):
 
     def log_prob(self, actions: th.Tensor) -> th.Tensor:
         return self.distribution.log_prob(actions)
+    
+    def logits(self) -> th.Tensor:
+        return self.distribution.logits
+    
+    def probs(self) -> th.Tensor:
+        return self.distribution.probs
 
     def entropy(self) -> th.Tensor:
         return self.distribution.entropy()

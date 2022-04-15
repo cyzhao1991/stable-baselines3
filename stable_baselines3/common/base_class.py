@@ -369,7 +369,7 @@ class BaseAlgorithm(ABC):
 
         # Create eval callback in charge of the evaluation
         if eval_env is not None:
-            eval_callback = EvalCallback(
+            eval_callback = c(
                 eval_env,
                 best_model_save_path=log_path,
                 log_path=log_path,

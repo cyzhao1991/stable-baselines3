@@ -103,10 +103,10 @@ class DiscreteSAC(OffPolicyAlgorithm):
         _init_setup_model: bool = True,
     ):
 
-        super(SAC, self).__init__(
+        super(DiscreteSAC, self).__init__(
             policy,
             env,
-            SACPolicy,
+            DiscreteSACPolicy,
             learning_rate,
             buffer_size,
             learning_starts,
@@ -124,9 +124,9 @@ class DiscreteSAC(OffPolicyAlgorithm):
             device=device,
             create_eval_env=create_eval_env,
             seed=seed,
-            use_sde=use_sde,
-            sde_sample_freq=sde_sample_freq,
-            use_sde_at_warmup=use_sde_at_warmup,
+            # use_sde=use_sde,
+            # sde_sample_freq=sde_sample_freq,
+            # use_sde_at_warmup=use_sde_at_warmup,
             optimize_memory_usage=optimize_memory_usage,
             supported_action_spaces=(gym.spaces.Discrete),
             support_multi_env=True,
@@ -144,12 +144,13 @@ class DiscreteSAC(OffPolicyAlgorithm):
             self._setup_model()
 
     def _setup_model(self) -> None:
-        super(SAC, self)._setup_model()
+        super(DiscreteSAC, self)._setup_model()
         self._create_aliases()
         # Target entropy is used when learning the entropy coefficient
         if self.target_entropy == "auto":
             # automatically set target entropy if needed
-            self.target_entropy = -np.prod(self.env.action_space.shape).astype(np.float32)
+            self.target_entropy = -1
+            # self.target_entropy = -np.prod(self.env.action_space.shape).astype(np.float32)
         else:
             # Force conversion
             # this will also throw an error for unexpected string
@@ -203,8 +204,13 @@ class DiscreteSAC(OffPolicyAlgorithm):
                 self.actor.reset_noise()
 
             # Action by the current actor for the sampled state
-            actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
-            log_prob = log_prob.reshape(-1, 1)
+            # actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
+            # log_prob = log_prob.reshape(-1, 1)
+            # actions_logits, actions_probs, _ = self.actor.get_action_dist_params(replay_data.observations)
+            actions_info = self.actor.get_action_dist_info(replay_data.observations)
+            actions_logits = actions_info['logits'] 
+            actions_probs = actions_info['probs'] 
+            actions_entropy = actions_info['entropy']
 
             ent_coef_loss = None
             if self.ent_coef_optimizer is not None:
@@ -212,7 +218,7 @@ class DiscreteSAC(OffPolicyAlgorithm):
                 # so we don't change it with other losses
                 # see https://github.com/rail-berkeley/softlearning/issues/60
                 ent_coef = th.exp(self.log_ent_coef.detach())
-                ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
+                ent_coef_loss = -(self.log_ent_coef * (-actions_entropy + self.target_entropy).detach()).mean()
                 ent_coef_losses.append(ent_coef_loss.item())
             else:
                 ent_coef = self.ent_coef_tensor
@@ -228,19 +234,26 @@ class DiscreteSAC(OffPolicyAlgorithm):
 
             with th.no_grad():
                 # Select action according to policy
-                next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
+                next_actions_info = self.actor.get_action_dist_info(replay_data.next_observations)
+                next_actions_logits = next_actions_info['logits']
+                next_actions_probs = next_actions_info['probs']
+                next_actions_entropy = actions_info['entropy']
+                
+                # next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
                 # Compute the next Q values: min over all critics targets
-                next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
-                next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
+                next_q_values = th.stack(self.critic_target.all_action_q_forward(replay_data.next_observations), dim = -1)
+                # next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
+                next_q_values, _ = th.min(next_q_values, dim=-1, keepdim=False)
                 # add entropy term
-                next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
+                next_v_values = th.sum( next_q_values * next_actions_probs, dim = -1, keepdim = True)
+                next_v_values = next_v_values - ent_coef * next_actions_entropy.reshape(-1, 1)
                 # td error + entropy term
-                target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+                target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_v_values
 
             # Get current Q-values estimates for each critic network
             # using action from the replay buffer
             current_q_values = self.critic(replay_data.observations, replay_data.actions)
-
+            
             # Compute critic loss
             critic_loss = 0.5 * sum([F.mse_loss(current_q, target_q_values) for current_q in current_q_values])
             critic_losses.append(critic_loss.item())
@@ -253,9 +266,12 @@ class DiscreteSAC(OffPolicyAlgorithm):
             # Compute actor loss
             # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
             # Mean over all critic networks
-            q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
-            min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
-            actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+            q_values_pi = th.stack(self.critic.all_action_q_forward(replay_data.observations), dim = -1)
+            # q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
+            min_qf_pi, _ = th.min(q_values_pi, dim=-1, keepdim=False)
+            min_qf_with_prob = th.sum(actions_probs * min_qf_pi, dim = -1, keepdim = True)
+            actor_loss = ( -ent_coef * actions_entropy - min_qf_with_prob).mean()
+            # actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
             actor_losses.append(actor_loss.item())
 
             # Optimize the actor
@@ -284,12 +300,12 @@ class DiscreteSAC(OffPolicyAlgorithm):
         eval_env: Optional[GymEnv] = None,
         eval_freq: int = -1,
         n_eval_episodes: int = 5,
-        tb_log_name: str = "SAC",
+        tb_log_name: str = "DiscreteSAC",
         eval_log_path: Optional[str] = None,
         reset_num_timesteps: bool = True,
     ) -> OffPolicyAlgorithm:
 
-        return super(SAC, self).learn(
+        return super(DiscreteSAC, self).learn(
             total_timesteps=total_timesteps,
             callback=callback,
             log_interval=log_interval,
@@ -302,7 +318,7 @@ class DiscreteSAC(OffPolicyAlgorithm):
         )
 
     def _excluded_save_params(self) -> List[str]:
-        return super(SAC, self)._excluded_save_params() + ["actor", "critic", "critic_target"]
+        return super(DiscreteSAC, self)._excluded_save_params() + ["actor", "critic", "critic_target"]
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
         state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]

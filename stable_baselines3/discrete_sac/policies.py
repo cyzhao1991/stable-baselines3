@@ -6,7 +6,7 @@ import torch as th
 from torch import nn
 
 from stable_baselines3.common.distributions import CategoricalDistribution
-from stable_baselines3.common.policies import BasePolicy, ContinuousCritic, register_policy
+from stable_baselines3.common.policies import BasePolicy, DiscreteCritic, register_policy
 from stable_baselines3.common.preprocessing import get_action_dim
 from stable_baselines3.common.torch_layers import (
     BaseFeaturesExtractor,
@@ -74,8 +74,8 @@ class Actor(BasePolicy):
         self.features_dim = features_dim
         self.activation_fn = activation_fn
 
-        if sde_net_arch is not None:
-            warnings.warn("sde_net_arch is deprecated and will be removed in SB3 v2.4.0.", DeprecationWarning)
+        # if sde_net_arch is not None:
+        #     warnings.warn("sde_net_arch is deprecated and will be removed in SB3 v2.4.0.", DeprecationWarning)
 
         action_dim = self.action_space.n
         pi_net = create_mlp(features_dim, action_dim, net_arch, activation_fn)
@@ -130,7 +130,12 @@ class Actor(BasePolicy):
         """
         features = self.extract_features(obs)
         action_logits = self.action_logits(features)
+        # self.action_dist.proba_distribution(action_logits)
+        # action_logits = self.action_dist.logits()
+        # action_probs = self.action_dist.probs()
+        # action_entropy = self.action_dist.entropy()
         return action_logits, {}
+    
 
     def forward(self, obs: th.Tensor, deterministic: bool = False) -> th.Tensor:
         action_logits, kwargs = self.get_action_dist_params(obs)
@@ -142,6 +147,13 @@ class Actor(BasePolicy):
         # return action and associated log prob
         return self.action_dist.log_prob_from_params(action_logits, **kwargs)
     
+    def get_action_dist_info(self, obs = None):
+        if obs is not None:
+            _ = self(obs, False)
+        logits = self.action_dist.logits()
+        probs = self.action_dist.probs()
+        entropy = self.action_dist.entropy()
+        return {'logits': logits, 'probs': probs, 'entropy': entropy}    
 
     def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
         return self(observation, deterministic)
@@ -193,6 +205,11 @@ class DiscreteSACPolicy(BasePolicy):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         n_critics: int = 2,
         share_features_extractor: bool = True,
+        use_sde: bool = False,
+        log_std_init: float = -3,
+        sde_net_arch: Optional[List[int]] = None,
+        use_expln: bool = False,
+        clip_mean: float = 2.0,
     ):
         super(DiscreteSACPolicy, self).__init__(
             observation_space,
@@ -295,9 +312,9 @@ class DiscreteSACPolicy(BasePolicy):
         actor_kwargs = self._update_features_extractor(self.actor_kwargs, features_extractor)
         return Actor(**actor_kwargs).to(self.device)
 
-    def make_critic(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> ContinuousCritic:
+    def make_critic(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> DiscreteCritic:
         critic_kwargs = self._update_features_extractor(self.critic_kwargs, features_extractor)
-        return ContinuousCritic(**critic_kwargs).to(self.device)
+        return DiscreteCritic(**critic_kwargs).to(self.device)
 
     def forward(self, obs: th.Tensor, deterministic: bool = False) -> th.Tensor:
         return self._predict(obs, deterministic=deterministic)
@@ -324,7 +341,7 @@ MlpPolicy = DiscreteSACPolicy
 
 
 Todo
-
+'''
 
 
 class CnnPolicy(DiscreteSACPolicy):
@@ -431,7 +448,7 @@ class MultiInputPolicy(DiscreteSACPolicy):
     def __init__(
         self,
         observation_space: gym.spaces.Space,
-        action_space: gym.spaces.Space,SACPolicy
+        action_space: gym.spaces.Space,
         lr_schedule: Schedule,
         net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
         activation_fn: Type[nn.Module] = nn.ReLU,
@@ -472,3 +489,4 @@ class MultiInputPolicy(DiscreteSACPolicy):
 register_policy("MlpPolicy", MlpPolicy)
 register_policy("CnnPolicy", CnnPolicy)
 register_policy("MultiInputPolicy", MultiInputPolicy)
+

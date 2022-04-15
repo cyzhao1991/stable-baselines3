@@ -897,7 +897,7 @@ class ContinuousCritic(BaseModel):
             features = self.extract_features(obs)
         return self.q_networks[0](th.cat([features, actions], dim=1))
     
-def DiscreteCritic(BaseModel):
+class DiscreteCritic(BaseModel):
     """
     Todo: add description
     """
@@ -920,7 +920,7 @@ def DiscreteCritic(BaseModel):
             normalize_images=normalize_images,
         )
 
-        action_dim = self.action_space.n
+        action_dim = self.action_dim = self.action_space.n
 
         self.share_features_extractor = share_features_extractor
         self.n_critics = n_critics
@@ -931,8 +931,33 @@ def DiscreteCritic(BaseModel):
             self.add_module(f"qf{idx}", q_net)
             self.q_networks.append(q_net)
             
-    def forward(self, 
+    def forward(self, obs: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, ...]:
+        # Learn the features extractor using the policy loss only
+        # when the features_extractor is shared with the actor
+        # with th.set_grad_enabled(not self.share_features_extractor):
+        #     features = self.extract_features(obs)
+        # qvalue_input = th.cat([features, actions], dim=1)
+        onehot = nn.functional.one_hot(actions.to(th.int64), num_classes = self.action_dim)
+        onehot = th.squeeze(onehot)
+        all_actions_q = self.all_action_q_forward(obs)
+        
+        return tuple( (all_q * onehot).sum(dim = 1, keepdim = True) for all_q in all_actions_q )
+        # return tuple(q_net(features)[actions] for q_net in self.q_networks)
 
+    def q1_forward(self, obs: th.Tensor, actions: th.Tensor) -> th.Tensor:
+        """
+        Only predict the Q-value using the first network.
+        This allows to reduce computation when all the estimates are not needed
+        (e.g. when updating the policy in TD3).
+        """
+        with th.no_grad():
+            features = self.extract_features(obs)
+        return self.q_networks[0](features)[actions]
+    
+    def all_action_q_forward(self, obs: th. Tensor) -> Tuple[th.Tensor, ...]:
+        with th.set_grad_enabled(not self.share_features_extractor):
+            features = self.extract_features(obs)
+        return tuple(q_net(features) for q_net in self.q_networks)
 
 _policy_registry = dict()  # type: Dict[Type[BasePolicy], Dict[str, Type[BasePolicy]]]
 
